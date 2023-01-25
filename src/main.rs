@@ -17,16 +17,19 @@ fn page_for_app(id: AppId) -> String {
 
 fn parse_price(price: &str) -> f32 {
     let price = price.to_lowercase();
-    if price.starts_with("free") || price.starts_with("free to play") {
+    if price.starts_with("free")
+        || price.starts_with("free to play")
+        || price.starts_with("install demo")
+    {
         0.0
     } else {
-        price
+        let new_price = price
             .replace(',', ".")
             .chars()
             .take_while(|c| *c != '€')
-            .collect::<String>()
-            .parse()
-            .unwrap()
+            .collect::<String>();
+        info!(new_price);
+        new_price.parse().unwrap()
     }
 }
 
