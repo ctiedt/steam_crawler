@@ -84,6 +84,7 @@ impl App {
 #[derive(Default)]
 struct Crawler {
     ids: VecDeque<AppId>,
+    should_not_crawl: Vec<AppId>,
     apps: Vec<App>,
 }
 
@@ -104,12 +105,18 @@ impl Crawler {
         while let Some(id) = self.ids.pop_front() {
             match time_or_count {
                 TimeOrCount::Time(time) => {
-                    if started_at.elapsed() < time && !self.apps.iter().any(|app| app.id == id) {
+                    if started_at.elapsed() < time
+                        && !self.apps.iter().any(|app| app.id == id)
+                        && !self.should_not_crawl.contains(&id)
+                    {
                         self.crawl_id(id)?;
                     }
                 }
                 TimeOrCount::Count(count) => {
-                    if self.apps.len() < count && !self.apps.iter().any(|app| app.id == id) {
+                    if self.apps.len() < count
+                        && !self.apps.iter().any(|app| app.id == id)
+                        && !self.should_not_crawl.contains(&id)
+                    {
                         self.crawl_id(id)?;
                     }
                 }
@@ -177,6 +184,7 @@ impl Crawler {
 
         if price.is_none() {
             info!("Skipping invalid app {id}");
+            self.should_not_crawl.push(id);
             return Ok(());
         }
 
