@@ -4,9 +4,11 @@ use std::{
 };
 
 use clap::Parser;
+use currency_rs::Currency;
 use scraper::{Html, Selector};
+use serde::Serializer;
 use serde_derive::Serialize;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 type AppId = u32;
@@ -22,11 +24,12 @@ fn parse_price(price: &str) -> f32 {
     } else {
         let new_price = price
             .replace(',', ".")
+            .replace('-', "")
             .chars()
             .take_while(|c| *c != '€')
             .collect::<String>();
         info!(new_price);
-        new_price.parse().unwrap()
+        new_price.parse().unwrap_or(0.0)
     }
 }
 
@@ -55,8 +58,17 @@ enum TimeOrCount {
 struct App {
     id: AppId,
     name: String,
+    #[serde(serialize_with = "flatten_tags")]
     tags: Vec<String>,
     price: f32,
+}
+
+fn flatten_tags<S>(tags: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let tags = tags.join(",");
+    serializer.serialize_str(&tags)
 }
 
 impl App {
@@ -158,7 +170,7 @@ impl Crawler {
                 }
 
                 match action.select(&price_selector).next() {
-                    Some(price_element) => parse_price(&price_element.inner_html().trim()),
+                    Some(price_element) => parse_price(price_element.inner_html().trim()),
                     None => 0.0,
                 }
             })
@@ -201,8 +213,15 @@ fn main() -> color_eyre::Result<()> {
     )?;
 
     let mut crawler = Crawler::new();
-    crawler.crawl(&opts.seed, time_or_count)?; // Portal
-    let apps = serde_json::to_string(crawler.apps())?;
-    println!("{apps}");
+    if let Err(e) = crawler.crawl(&opts.seed, time_or_count) {
+        warn!("An error occured during crawling: {e:?}. Printing possibly invalid data.")
+    }
+
+    let mut apps = csv::WriterBuilder::default()
+        .delimiter(b';')
+        .from_writer(std::io::stdout());
+    for app in crawler.apps() {
+        apps.serialize(app)?;
+    }
     Ok(())
 }
