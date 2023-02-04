@@ -4,7 +4,6 @@ use std::{
 };
 
 use clap::Parser;
-use currency_rs::Currency;
 use scraper::{Html, Selector};
 use serde::Serializer;
 use serde_derive::Serialize;
