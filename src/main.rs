@@ -1,9 +1,12 @@
 use std::{
     collections::{HashSet, VecDeque},
+    hash::Hash,
+    sync::{Arc, RwLock},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use scraper::{Html, Selector};
 use serde::Serializer;
 use serde_derive::Serialize;
@@ -18,7 +21,7 @@ fn page_for_app(id: AppId) -> String {
 
 fn parse_price(price: &str) -> f32 {
     let price = price.to_lowercase();
-    if price.starts_with("free") || price.starts_with("free to play") || price.contains("demo") {
+    if price.starts_with("free") || price.contains("play with firefly") || price.contains("demo") {
         0.0
     } else {
         let new_price = price
@@ -43,9 +46,18 @@ struct Options {
     /// The time to crawl for
     #[arg(short, long, required_unless_present("count"))]
     time: Option<u64>,
+    /// The output format (csv or json)
+    #[arg(short, long)]
+    format: Option<OutputFormat>,
     /// The space-separated list of seed IDs
     #[arg(required = true)]
     seed: Vec<AppId>,
+}
+
+#[derive(Clone, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Csv,
 }
 
 enum TimeOrCount {
@@ -53,7 +65,7 @@ enum TimeOrCount {
     Count(usize),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct App {
     id: AppId,
     name: String,
@@ -61,6 +73,16 @@ struct App {
     tags: Vec<String>,
     price: f32,
 }
+
+impl Hash for App {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.name.hash(state);
+        self.tags.hash(state);
+    }
+}
+
+impl Eq for App {}
 
 fn flatten_tags<S>(tags: &[String], serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -83,9 +105,10 @@ impl App {
 
 #[derive(Default)]
 struct Crawler {
-    ids: VecDeque<AppId>,
-    should_not_crawl: Vec<AppId>,
-    apps: Vec<App>,
+    ids: Arc<RwLock<VecDeque<AppId>>>,
+    should_not_crawl: Arc<RwLock<Vec<AppId>>>,
+    apps: Arc<RwLock<HashSet<App>>>,
+    threads: VecDeque<JoinHandle<color_eyre::Result<()>>>,
 }
 
 impl Crawler {
@@ -93,115 +116,150 @@ impl Crawler {
         Default::default()
     }
 
-    fn apps(&self) -> &[App] {
-        &self.apps
+    fn apps(&self) -> Vec<App> {
+        self.apps.read().unwrap().clone().into_iter().collect()
     }
 
     fn crawl(&mut self, initial: &[AppId], time_or_count: TimeOrCount) -> color_eyre::Result<()> {
         for id in initial {
-            self.ids.push_back(*id);
+            self.ids.write().unwrap().push_back(*id);
         }
         let started_at = Instant::now();
-        while let Some(id) = self.ids.pop_front() {
-            match time_or_count {
-                TimeOrCount::Time(time) => {
-                    if started_at.elapsed() < time
-                        && !self.apps.iter().any(|app| app.id == id)
-                        && !self.should_not_crawl.contains(&id)
-                    {
-                        self.crawl_id(id)?;
+
+        loop {
+            let id = self.ids.write().unwrap().pop_front();
+            if let Some(id) = id {
+                match time_or_count {
+                    TimeOrCount::Time(time) => {
+                        let app_known = self.apps.read().unwrap().iter().any(|app| app.id == id);
+                        let should_not_crawl = self.should_not_crawl.read().unwrap().contains(&id);
+                        if started_at.elapsed() < time && !app_known && !should_not_crawl {
+                            let ids = self.ids.clone();
+                            let should_not_crawl = self.should_not_crawl.clone();
+                            let apps = self.apps.clone();
+                            self.threads.push_back(std::thread::spawn(move || {
+                                crawl_id(id, ids, should_not_crawl, apps)
+                            }));
+                        }
+                    }
+                    TimeOrCount::Count(count) => {
+                        let len = self.apps.read().unwrap().len();
+                        let app_known = self.apps.read().unwrap().iter().any(|app| app.id == id);
+                        let should_not_crawl = self.should_not_crawl.read().unwrap().contains(&id);
+                        if len < count && !app_known && !should_not_crawl {
+                            let ids = self.ids.clone();
+                            let should_not_crawl = self.should_not_crawl.clone();
+                            let apps = self.apps.clone();
+                            self.threads.push_back(std::thread::spawn(move || {
+                                crawl_id(id, ids, should_not_crawl, apps)
+                            }));
+                        }
                     }
                 }
-                TimeOrCount::Count(count) => {
-                    if self.apps.len() < count
-                        && !self.apps.iter().any(|app| app.id == id)
-                        && !self.should_not_crawl.contains(&id)
-                    {
-                        self.crawl_id(id)?;
+            } else {
+                let len = self.apps.read().unwrap().len();
+                if let TimeOrCount::Count(count) = time_or_count {
+                    if len < count {
+                        info!("{len} entries");
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    } else {
+                        break;
                     }
                 }
             }
         }
-        Ok(())
-    }
 
-    fn crawl_id(&mut self, id: AppId) -> color_eyre::Result<()> {
-        info!("Crawling id {id}");
-        let page = ureq::get(&page_for_app(id))
-            .set(
-                "Cookie",
-                "wants_mature_content=1; birthtime=1101855601; lastagecheckage=1-0-2000",
-            )
-            .call()?
-            .into_string()?;
-        let document = Html::parse_document(&page);
-
-        let link_selector = Selector::parse("a").unwrap();
-        let links: HashSet<AppId> = document
-            .select(&link_selector)
-            .filter_map(|e| {
-                e.value()
-                    .attr("href")
-                    .filter(|&href| href.starts_with("https://store.steampowered.com/app/"))
-            })
-            .map(|link| {
-                let url = Url::parse(link).unwrap();
-                url.path_segments()
-                    .unwrap()
-                    .nth(1)
-                    .unwrap()
-                    .parse()
-                    .unwrap()
-            })
-            .collect();
-
-        self.ids
-            .append(&mut links.into_iter().collect::<VecDeque<_>>());
-
-        let tag_selector = Selector::parse(".app_tag").unwrap();
-        let tags: Vec<_> = document
-            .select(&tag_selector)
-            .map(|e| e.inner_html().trim().to_string())
-            .filter(|tag| tag != "+")
-            .collect();
-        let price_selector = Selector::parse(".price").unwrap();
-        let purchase_selector = Selector::parse(".game_purchase_action").unwrap();
-        let price = document
-            .select(&purchase_selector)
-            .map(|action| {
-                if let Some(id) = action.value().id() {
-                    if id == "dlc_purchase_action" {
-                        return 0.0;
-                    }
-                }
-
-                match action.select(&price_selector).next() {
-                    Some(price_element) => parse_price(price_element.inner_html().trim()),
-                    None => 0.0,
-                }
-            })
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        if price.is_none() {
-            info!("Skipping invalid app {id}");
-            self.should_not_crawl.push(id);
-            return Ok(());
+        while let Some(thread) = self.threads.pop_front() {
+            thread.join().unwrap()?;
         }
 
-        let price = price.unwrap();
-        let name_selector = Selector::parse(".apphub_AppName").unwrap();
-        let name = document
-            .select(&name_selector)
-            .next()
-            .unwrap()
-            .inner_html()
-            .trim()
-            .to_string();
-
-        let app = App::new(id, name, tags, price);
-        self.apps.push(app);
         Ok(())
     }
+}
+
+fn crawl_id(
+    id: AppId,
+    ids: Arc<RwLock<VecDeque<AppId>>>,
+    should_not_crawl: Arc<RwLock<Vec<AppId>>>,
+    apps: Arc<RwLock<HashSet<App>>>,
+) -> color_eyre::Result<()> {
+    info!("Crawling id {id}");
+    let page = ureq::get(&page_for_app(id))
+        .set(
+            "Cookie",
+            "wants_mature_content=1; birthtime=1101855601; lastagecheckage=1-0-2000",
+        )
+        .call()?
+        .into_string()?;
+    let document = Html::parse_document(&page);
+
+    let link_selector = Selector::parse("a").unwrap();
+    let links: HashSet<AppId> = document
+        .select(&link_selector)
+        .filter_map(|e| {
+            e.value()
+                .attr("href")
+                .filter(|&href| href.starts_with("https://store.steampowered.com/app/"))
+        })
+        .map(|link| {
+            let url = Url::parse(link).unwrap();
+            url.path_segments()
+                .unwrap()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+
+    ids.write()
+        .unwrap()
+        .append(&mut links.into_iter().collect::<VecDeque<_>>());
+
+    let tag_selector = Selector::parse(".app_tag").unwrap();
+    let tags: Vec<_> = document
+        .select(&tag_selector)
+        .map(|e| e.inner_html().trim().to_string())
+        .filter(|tag| tag != "+")
+        .collect();
+    let price_selector = Selector::parse(".price").unwrap();
+    let purchase_selector = Selector::parse(".game_purchase_action").unwrap();
+    let price = document
+        .select(&purchase_selector)
+        .map(|action| {
+            if let Some(id) = action.value().id() {
+                if id == "dlc_purchase_action" {
+                    return 0.0;
+                }
+            }
+
+            match action.select(&price_selector).next() {
+                Some(price_element) => parse_price(price_element.inner_html().trim()),
+                None => 0.0,
+            }
+        })
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if price.is_none() {
+        info!("Skipping invalid app {id}");
+        should_not_crawl.write().unwrap().push(id);
+        return Ok(());
+    }
+
+    let price = price.unwrap();
+    let name_selector = Selector::parse(".apphub_AppName").unwrap();
+    let name = document
+        .select(&name_selector)
+        .next()
+        .unwrap()
+        .inner_html()
+        .trim()
+        .to_string();
+
+    let app = App::new(id, name, tags, price);
+    apps.write().unwrap().insert(app);
+    Ok(())
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -220,15 +278,25 @@ fn main() -> color_eyre::Result<()> {
     )?;
 
     let mut crawler = Crawler::new();
+
     if let Err(e) = crawler.crawl(&opts.seed, time_or_count) {
         warn!("An error occured during crawling: {e:?}. Printing possibly invalid data.")
     }
 
-    let mut apps = csv::WriterBuilder::default()
-        .delimiter(b';')
-        .from_writer(std::io::stdout());
-    for app in crawler.apps() {
-        apps.serialize(app)?;
+    match opts.format {
+        Some(OutputFormat::Json) => {
+            let apps = serde_json::to_string(&crawler.apps())?;
+            println!("{apps}")
+        }
+        _ => {
+            let mut apps = csv::WriterBuilder::default()
+                .delimiter(b';')
+                .from_writer(std::io::stdout());
+            for app in crawler.apps() {
+                apps.serialize(app)?;
+            }
+        }
     }
+
     Ok(())
 }
