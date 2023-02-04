@@ -17,10 +17,7 @@ fn page_for_app(id: AppId) -> String {
 
 fn parse_price(price: &str) -> f32 {
     let price = price.to_lowercase();
-    if price.starts_with("free")
-        || price.starts_with("free to play")
-        || price.starts_with("install demo")
-    {
+    if price.starts_with("free") || price.starts_with("free to play") || price.contains("demo") {
         0.0
     } else {
         let new_price = price
@@ -150,14 +147,29 @@ impl Crawler {
             .filter(|tag| tag != "+")
             .collect();
         let price_selector = Selector::parse(".price").unwrap();
-        let price_element = document.select(&price_selector).next();
+        let purchase_selector = Selector::parse(".game_purchase_action").unwrap();
+        let price = document
+            .select(&purchase_selector)
+            .map(|action| {
+                if let Some(id) = action.value().id() {
+                    if id == "dlc_purchase_action" {
+                        return 0.0;
+                    }
+                }
 
-        if price_element.is_none() {
+                match action.select(&price_selector).next() {
+                    Some(price_element) => parse_price(&price_element.inner_html().trim()),
+                    None => 0.0,
+                }
+            })
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        if price.is_none() {
             info!("Skipping invalid app {id}");
             return Ok(());
         }
 
-        let price = parse_price(price_element.unwrap().inner_html().trim());
+        let price = price.unwrap();
         let name_selector = Selector::parse(".apphub_AppName").unwrap();
         let name = document
             .select(&name_selector)
