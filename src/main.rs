@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     hash::Hash,
     sync::{Arc, RwLock},
-    thread::JoinHandle,
+    thread::{self, Builder, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -21,7 +21,11 @@ fn page_for_app(id: AppId) -> String {
 
 fn parse_price(price: &str) -> f32 {
     let price = price.to_lowercase();
-    if price.starts_with("free") || price.contains("play with firefly") || price.contains("demo") {
+    if price.starts_with("free")
+        || price.contains("play with firefly")
+        || price.contains("demo")
+        || price.contains("come inside and play with me for free!")
+    {
         0.0
     } else {
         let new_price = price
@@ -137,9 +141,16 @@ impl Crawler {
                             let ids = self.ids.clone();
                             let should_not_crawl = self.should_not_crawl.clone();
                             let apps = self.apps.clone();
-                            self.threads.push_back(std::thread::spawn(move || {
-                                crawl_id(id, ids, should_not_crawl, apps)
-                            }));
+
+                            match Builder::new()
+                                .spawn(move || crawl_id(id, ids, should_not_crawl, apps))
+                            {
+                                Ok(handle) => self.threads.push_back(handle),
+                                Err(e) => {
+                                    warn!("Error while creating thread: {e}");
+                                    self.ids.write().unwrap().push_back(id);
+                                }
+                            }
                         }
                     }
                     TimeOrCount::Count(count) => {
@@ -150,9 +161,16 @@ impl Crawler {
                             let ids = self.ids.clone();
                             let should_not_crawl = self.should_not_crawl.clone();
                             let apps = self.apps.clone();
-                            self.threads.push_back(std::thread::spawn(move || {
-                                crawl_id(id, ids, should_not_crawl, apps)
-                            }));
+
+                            match Builder::new()
+                                .spawn(move || crawl_id(id, ids, should_not_crawl, apps))
+                            {
+                                Ok(handle) => self.threads.push_back(handle),
+                                Err(e) => {
+                                    warn!("Error while creating thread: {e}");
+                                    self.ids.write().unwrap().push_back(id);
+                                }
+                            }
                         }
                     }
                 }
