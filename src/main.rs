@@ -245,16 +245,21 @@ fn crawl_id(
     let purchase_selector = Selector::parse(".game_purchase_action").unwrap();
     let price = document
         .select(&purchase_selector)
-        .map(|action| {
+        .filter_map(|action| {
             if let Some(id) = action.value().id() {
                 if id == "dlc_purchase_action" {
-                    return 0.0;
+                    return None;
                 }
             }
 
+            let package_selector = Selector::parse(".btn_packageinfo").unwrap();
+            if action.select(&package_selector).next().is_some() {
+                return None;
+            }
+
             match action.select(&price_selector).next() {
-                Some(price_element) => parse_price(price_element.inner_html().trim()),
-                None => 0.0,
+                Some(price_element) => Some(parse_price(price_element.inner_html().trim())),
+                None => None,
             }
         })
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
